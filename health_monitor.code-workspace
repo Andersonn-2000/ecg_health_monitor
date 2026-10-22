@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../health_monitor"
+		},
+		{
+			"name": "health_monitor",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
