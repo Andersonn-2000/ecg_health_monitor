@@ -16,6 +16,12 @@
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
 
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
+
 // pinout
 #define PIN_SDA       21
 #define PIN_SCL       22
@@ -68,6 +74,19 @@ struct VitalSigns {
     bool tempValid;
 };
 
+// Wifi e WebSocket
+
+const char* hostname = "monitorvital";
+const int port = 80;
+const char* ssid = "ESP32_SinaisVitais";
+const char* password = "12345678";
+
+// criação do objeto do server e do websocket (url "/wb")
+
+AsyncWebServer server(port);
+AsyncWebSocket ws("/ws");
+bool isServerRunning = false;
+
 // objetos e recursos compartilhados
 
 Adafruit_ADS1015 ads;
@@ -114,6 +133,35 @@ void updateTemperature(float tempC, bool valid) {
         xSemaphoreGive(mutexVital);
     }
 }
+// função para formatação e envio dos dados vitais em JSON para os clientes WebSocket
+
+void broadcastVitalSigns(VitalSigns *v) {
+    if (ws.count() == 0) return;
+
+    char jsonBuffer[256];
+    snprintf(jsonBuffer, sizeof(jsonBuffer), 
+             "{\"leadoff\":%d,\"bpmECG\":%.1f,\"fingerPresent\":%d,\"bpmPPGValid\":%d,\"bpmPPG\":%ld,\"spo2Valid\":%d,\"spo2\":%ld}",
+             v->leadoff, 
+             v->bpmECG, 
+             v->fingerPresent, 
+             v->bpmPPGValid, 
+             (long)v->bpmPPG, 
+             v->spo2Valid, 
+             (long)v->spo2);
+    
+    ws.textAll(jsonBuffer);
+}
+
+// evento do WebSocket (trata conexões/desconexões)
+
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_CONNECT) {
+        Serial.printf("Cliente WebSocket #%u conectado de %s\n", client->id(), client->remoteIP().toString().c_str());
+    } else if (type == WS_EVT_DISCONNECT) {
+        Serial.printf("Cliente WebSocket #%u desconectado\n", client->id());
+    }
+}
+
 // Tasks
 
 // Task 1: Aquisição do ECG
@@ -519,6 +567,9 @@ void taskMonitor(void *parametro) {
         }
 
         Serial.println("*********************************");
+
+        if (isServerRunning) broadcastVitalSigns(&v);
+
         vTaskDelayUntil(&previousState, pdMS_TO_TICKS(1000));
     }
 }
@@ -534,6 +585,32 @@ void setup() {
 
     Wire.begin(PIN_SDA, PIN_SCL);
     Wire.setClock(400000);
+
+    // cria ponto de acesso AP, configura e inicia o WebServer
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid, password);
+    Serial.printf("Rede WiFi \"%s\" criada com sucesso", ssid);
+    Serial.println("Endereço IP do AP: " + String(WiFi.softAPIP())); // geralmente 192.168.4.1
+
+    // inicializa o mDNS
+    if(MDNS.begin(hostname)) {
+        Serial.printf("mDNS iniciado! Acesse: http://%s.local", hostname);
+        MDNS.addService("html", "tcp", port);
+    } else {
+        Serial.println("Aviso: Erro ao configurar mDNS.");
+    }
+
+    // inicializa a memória Flash
+    if (LittleFS.begin(true)) {
+        server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+    } else {
+        Serial.println("Erro ao montar LittleFS");
+    }
+
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+    server.begin();
+    isServerRunning = true;
 
     // cria os recursos antes de inicializar as tarefas.
     mutexI2C = xSemaphoreCreateMutex();
@@ -622,5 +699,8 @@ void setup() {
 // loop principal
 
 void loop() {
-    vTaskDelay(portMAX_DELAY);
+    // limpa clientes que se desconectam abruptamente
+    if (isServerRunning) ws.cleanupClients();
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
 }
