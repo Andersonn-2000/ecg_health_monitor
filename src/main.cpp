@@ -4,6 +4,9 @@
 #include <math.h>
 #include <string.h>
 
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -18,26 +21,30 @@
 #define PIN_SCL       22
 #define PIN_LO_PLUS   32
 #define PIN_LO_MINUS  33
+#define PIN_ONEWIRE    4 // DS18B20
 
 #define ADS_ENDERECO  0x48
 
-// periodo de aquisicao do ECG
-#define ECG_PERIODO_MS 4
-
-// max30102 configurado para 100 amostras/s
+// MAX30102
 #define PPG_PERIODO_MS 10
-
 #define PPG_BUFFER_SIZE 100
 #define PPG_PASSO 25
-
 #define LIMIAR_DEDO_IR 50000UL
 
-// parametros do detector ECG
+// ADS8232
+#define ECG_PERIODO_MS 4 // periodo de aquisicao do ECG
 #define ECG_LIMIAR_MIN_MV 10.0f
 #define ECG_ENVELOPE_MIN_MV 15.0f
 #define ECG_REFRACTARIO_MS 250
 #define ECG_RR_MIN_MS 250
 #define ECG_RR_MAX_MS 2000
+
+// DS18B20
+#define TEMP_RESOLUTION_BITS 12
+#define TEMP_PERIOD_MS 1000
+#define TEMP_ERRORS_MS 3
+#define TEMP_ALPHA 0.4f
+#define TEMP_OFFSET_C 0.0f
 
 // estruturas
 
@@ -57,6 +64,8 @@ struct VitalSigns {
     int32_t bpmPPG;
     bool bpmPPGValid;
     bool fingerPresent;
+    float tempC;
+    bool tempValid;
 };
 
 // objetos e recursos compartilhados
@@ -98,6 +107,13 @@ void invalidatePPG(bool fingerPresent) {
     }
 }
 
+void updateTemperature(float tempC, bool valid) {
+    if (xSemaphoreTake(mutexVital, pdMS_TO_TICKS(10)) == pdTRUE) {
+        vital.tempC = valid ? tempC: 0.0f;
+        vital.tempValid = valid;
+        xSemaphoreGive(mutexVital);
+    }
+}
 // Tasks
 
 // Task 1: Aquisição do ECG
@@ -352,9 +368,8 @@ void taskPPG(void *parametro) {
                 }
             }
 
-            // Analisa o primeiro buffer completo e, depois,
-            // somente quando houver pelo menos PPG_PASSO
-            // new amostras.
+            // analisa o primeiro buffer completo e, depois,
+            // somente quando houver pelo menos PPG_PASSO novas amostras
             bool shouldAnalyze = full >= PPG_BUFFER_SIZE && (!bufferAnalised || news >= PPG_PASSO);
 
             if (shouldAnalyze) {
@@ -391,7 +406,69 @@ void taskPPG(void *parametro) {
     }
 }
 
-// Task 4: monitor serial
+// Task 4: temperatura corporal
+void taskTemperature(void *pv){
+    OneWire oneWire(PIN_ONEWIRE);
+    DallasTemperature sensors(&oneWire);
+    DeviceAddress addr;
+
+    bool found = false;
+    bool hasFiltered = false;
+    float filtered = 0.0f;
+    uint8_t failures = 0;
+
+    TickType_t previousState = xTaskGetTickCount();
+
+    for (;;) {
+        if(!found) {
+            sensors.begin();
+            found = sensors.getAddress(addr, 0);
+
+            if(!found) {
+                updateTemperature(0.0f, false);
+                hasFiltered = false;
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                previousState = xTaskGetTickCount();
+                continue;
+            }
+
+            sensors.setResolution(addr, TEMP_RESOLUTION_BITS);
+            sensors.setWaitForConversion(false);
+            failures = 0;
+        }
+
+        sensors.requestTemperaturesByAddress(addr);
+        vTaskDelay(pdMS_TO_TICKS(sensors.millisToWaitForConversion(TEMP_RESOLUTION_BITS) + 50));
+
+        float t = sensors.getTempC(addr);
+        bool ok = (t != DEVICE_DISCONNECTED_C) && (t != 85.0f) && (t > -55.0f) && (t < 125.0f);
+
+        if (ok) {
+            failures = 0;
+            t += TEMP_OFFSET_C;
+
+            if (!hasFiltered) {
+                filtered = t;
+                hasFiltered = true;
+            } else {
+                filtered = filtered + TEMP_ALPHA * (t-filtered);
+            }
+
+            updateTemperature(filtered, true);
+            
+        } else if (++failures >= TEMP_ERRORS_MS){
+            updateTemperature(0.0f, false);
+            hasFiltered = false;
+            found = false;
+            failures = 0;
+        }
+
+        vTaskDelayUntil(&previousState, pdMS_TO_TICKS(TEMP_PERIOD_MS));
+
+    }
+}
+
+// Task 5: monitor serial
 
 void taskMonitor(void *parametro) {
     TickType_t previousState = xTaskGetTickCount();
@@ -425,14 +502,20 @@ void taskMonitor(void *parametro) {
             if (v.bpmPPGValid) {
                 Serial.printf("BPM PPG: %ld\n", (long)v.bpmPPG);
             } else {
-                Serial.println("BPM PPG: result invalido");
+                Serial.println("BPM PPG: resultado invalido");
             }
 
             if (v.spo2Valid) {
                 Serial.printf("SpO2: %ld%%\n", (long)v.spo2);
             } else {
-                Serial.println("SpO2: result invalido");
+                Serial.println("SpO2: resultado invalido");
             }
+        }
+
+        if (v.tempValid) {
+            Serial.printf("Temperatuta: %.2f C\n", v.tempC);
+        } else {
+            Serial.println("Temperatura: sensor sem leitura!");
         }
 
         Serial.println("*********************************");
@@ -521,6 +604,14 @@ void setup() {
     result = xTaskCreatePinnedToCore(taskMonitor, "Monitor", 4096, nullptr, 1, nullptr, 0);
     if (result != pdPASS) {
         Serial.println("Nao foi possivel criar taskMonitor!");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    result = xTaskCreatePinnedToCore(taskTemperature, "Temperature", 4096, nullptr, 1, nullptr, 0);
+    if (result != pdPASS){
+        Serial.printf("Não foi possivel criar taskTemperature!");
         while (true) {
             delay(1000);
         }
