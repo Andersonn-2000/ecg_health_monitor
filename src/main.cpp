@@ -78,8 +78,8 @@ struct VitalSigns {
 
 const char* hostname = "monitorvital";
 const int port = 80;
-const char* ssid = "ESP32_SinaisVitais";
-const char* password = "12345678";
+const char* ssid = "Nuclic_5g";
+const char* password = "9azGDfy^155g";
 
 // criação do objeto do server e do websocket (url "/wb")
 

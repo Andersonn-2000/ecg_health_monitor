@@ -38,8 +38,8 @@
 
     <script>
         // Substitua pelo IP impresso no Monitor Serial do seu ESP32
-        const esp32IP = "192.168.1.50"; 
-        const socket = new WebSocket(`ws://${esp32IP}/ws`);
+        //const esp32IP = "192.168.1.50"; 
+        const socket = new WebSocket(`ws://${location.host}/ws`);
 
         const connEl = document.getElementById('connection');
         const bpmEcgEl = document.getElementById('bpmECG');
