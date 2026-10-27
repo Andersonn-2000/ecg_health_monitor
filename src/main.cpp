@@ -65,6 +65,7 @@ struct SampleECG {
 struct VitalSigns {
     float bpmECG;
     bool leadoff;
+    float ecg_mV;
     int32_t spo2;
     bool spo2Valid;
     int32_t bpmPPG;
@@ -78,8 +79,8 @@ struct VitalSigns {
 
 const char* hostname = "monitorvital";
 const int port = 80;
-const char* ssid = "Nuclic_5g";
-const char* password = "9azGDfy^155g";
+const char* ssid = "TP-LINK_D16A";
+const char* password = "35854180";
 
 // criação do objeto do server e do websocket (url "/wb")
 
@@ -138,17 +139,14 @@ void updateTemperature(float tempC, bool valid) {
 void broadcastVitalSigns(VitalSigns *v) {
     if (ws.count() == 0) return;
 
-    char jsonBuffer[256];
-    snprintf(jsonBuffer, sizeof(jsonBuffer), 
-             "{\"leadoff\":%d,\"bpmECG\":%.1f,\"fingerPresent\":%d,\"bpmPPGValid\":%d,\"bpmPPG\":%ld,\"spo2Valid\":%d,\"spo2\":%ld}",
-             v->leadoff, 
-             v->bpmECG, 
-             v->fingerPresent, 
-             v->bpmPPGValid, 
-             (long)v->bpmPPG, 
-             v->spo2Valid, 
-             (long)v->spo2);
-    
+    char jsonBuffer[380];
+    snprintf(jsonBuffer, sizeof(jsonBuffer),
+             "{\"leadoff\":%d,\"bpmECG\":%.1f,\"ecg_mV\":%.2f,\"fingerPresent\":%d,\"bpmPPGValid\":%d,\"bpmPPG\":%ld,"
+             "\"spo2Valid\":%d,\"spo2\":%ld,\"tempValid\":%d,\"tempC\":%.2f}",
+             v->leadoff, v->bpmECG, v->ecg_mV, v->fingerPresent, v->bpmPPGValid,
+             (long)v->bpmPPG, v->spo2Valid, (long)v->spo2,
+             v->tempValid, v->tempC);
+
     ws.textAll(jsonBuffer);
 }
 
@@ -276,6 +274,10 @@ void taskProcessECG(void *parametro) {
         baseline = baseline * 0.99f + sample.mV * 0.01f;
         float sinal = sample.mV - baseline;
 
+        if (xSemaphoreTake(mutexVital, pdMS_TO_TICKS(2)) == pdTRUE){
+            vital.ecg_mV = sinal;
+            xSemaphoreGive(mutexVital);
+        }
         // envelope baseado na magnitude do sinal.
         float magnitude = fabsf(sinal);
         if (magnitude > envelope) {
@@ -535,6 +537,7 @@ void taskMonitor(void *parametro) {
 
         Serial.println();
         Serial.println("-------- Sinais Vitais --------");
+        Serial.printf("Acesse: http://%s  (rede: %s)\n", WiFi.softAPIP().toString().c_str(), ssid);
 
         if (v.leadoff) {
             Serial.println("ECG: eletrodos desconectados");
@@ -589,13 +592,14 @@ void setup() {
     // cria ponto de acesso AP, configura e inicia o WebServer
     WiFi.mode(WIFI_AP);
     WiFi.softAP(ssid, password);
-    Serial.printf("Rede WiFi \"%s\" criada com sucesso", ssid);
-    Serial.println("Endereço IP do AP: " + String(WiFi.softAPIP())); // geralmente 192.168.4.1
+    delay(100);
+    Serial.printf("Rede WiFi \"%s\" criada com sucesso\n", ssid);
+    Serial.printf("Endereço IP do AP: %s\n", WiFi.softAPIP().toString()); // geralmente 192.168.4.1
 
     // inicializa o mDNS
     if(MDNS.begin(hostname)) {
-        Serial.printf("mDNS iniciado! Acesse: http://%s.local", hostname);
-        MDNS.addService("html", "tcp", port);
+        Serial.printf("mDNS iniciado! Acesse: http://%s.local\n", hostname);
+        MDNS.addService("http", "tcp", port);
     } else {
         Serial.println("Aviso: Erro ao configurar mDNS.");
     }
