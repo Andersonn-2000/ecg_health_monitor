@@ -50,10 +50,13 @@ canvas { width: 100%; height: 180px; display: block; background: #0b1220; border
     <h3>ECG Filtrado <span id="ecgScale">--</span></h3>
     <canvas id="ecgCanvas"></canvas>
   </div>
+  <div class="chart-box">
+    <h3>PPG (Oximetria - IR) <span id="ppgScale">--</span></h3>
+    <canvas id="ppgCanvas"></canvas>
+  </div>
 </div>
 
 <script>
-// ---------- Gráfico em rolagem simples para o ECG ----------
 class Chart {
   constructor(canvas, { size, color, minSpan, scaleEl, unit }) {
     this.cv = canvas;
@@ -87,7 +90,6 @@ class Chart {
     const { ctx, w, h, size, count } = this;
     ctx.clearRect(0, 0, w, h);
 
-    // Linha central de referência
     ctx.strokeStyle = '#1e2a44'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2);
@@ -111,7 +113,6 @@ class Chart {
     const span = Math.max(mx - mn, this.minSpan) * 1.2;
     const lo = mid - span / 2;
     const range = span || 1;
-
     const pxPerSample = w / (size - 1);
 
     ctx.strokeStyle = this.color; ctx.lineWidth = 1.8; ctx.lineJoin = 'round';
@@ -130,17 +131,24 @@ class Chart {
   }
 }
 
+// Gráfico de ECG (tamanho maior para acomodar 250Hz / taxa de fluxo)
 const ecgChart = new Chart(document.getElementById('ecgCanvas'), {
-  size: 150, color: '#4ade80', minSpan: 5,
+  size: 250, color: '#4ade80', minSpan: 5,
   scaleEl: document.getElementById('ecgScale'), unit: 'mV'
+});
+
+// Gráfico de PPG (Oximetria)
+const ppgChart = new Chart(document.getElementById('ppgCanvas'), {
+  size: 200, color: '#38bdf8', minSpan: 100,
+  scaleEl: document.getElementById('ppgScale'), unit: 'units'
 });
 
 (function loop() {
   ecgChart.draw();
+  ppgChart.draw();
   requestAnimationFrame(loop);
 })();
 
-// ---------- Elementos de texto ----------
 const connEl = document.getElementById('connection');
 const bpmEcgEl = document.getElementById('bpmECG');
 const ecgStatusEl = document.getElementById('ecgStatus');
@@ -150,9 +158,7 @@ const spo2El = document.getElementById('spo2');
 const tempEl = document.getElementById('temp');
 const tempStatusEl = document.getElementById('tempStatus');
 
-// ---------- Tratamento das mensagens JSON do ESP32 ----------
 function handleJson(data) {
-  // ECG Status e Valor no gráfico
   if (data.leadoff) {
     bpmEcgEl.innerText = "--";
     ecgStatusEl.innerText = "Eletrodos desconectados";
@@ -162,19 +168,14 @@ function handleJson(data) {
     bpmEcgEl.innerText = data.bpmECG > 0 ? data.bpmECG.toFixed(1) : "--";
     ecgStatusEl.innerText = data.bpmECG > 0 ? "Leitura normal" : "Detectando...";
     ecgStatusEl.classList.remove('alert');
-
-    // Insere o valor atual do ECG filtrado enviado pelo firmware
-    if (data.ecg_mV !== undefined) {
-      ecgChart.push(data.ecg_mV);
-    }
   }
 
-  // PPG e SpO2
   if (!data.fingerPresent) {
     bpmPpgEl.innerText = "--";
     spo2El.innerText = "-- %";
     ppgStatusEl.innerText = "Dedo ausente";
     ppgStatusEl.classList.add('alert');
+    ppgChart.clear();
   } else {
     ppgStatusEl.classList.remove('alert');
     bpmPpgEl.innerText = data.bpmPPGValid ? data.bpmPPG : "--";
@@ -182,7 +183,6 @@ function handleJson(data) {
     spo2El.innerText = data.spo2Valid ? `${data.spo2}%` : "-- %";
   }
 
-  // Temperatura
   if (data.tempValid) {
     tempEl.innerText = `${data.tempC.toFixed(1)} °C`;
     tempStatusEl.innerText = "Leitura OK";
@@ -194,7 +194,6 @@ function handleJson(data) {
   }
 }
 
-// ---------- WebSocket com reconexão automática ----------
 function connect() {
   const socket = new WebSocket(`ws://${location.host}/ws`);
 
@@ -209,7 +208,17 @@ function connect() {
   };
   socket.onmessage = (event) => {
     try { 
-      handleJson(JSON.parse(event.data)); 
+      const data = JSON.parse(event.data);
+      if (data.w === 1) {
+        if (data.ecg) {
+          for (let i = 0; i < data.ecg.length; i++) ecgChart.push(data.ecg[i]);
+        }
+        if (data.ir) {
+          for (let i = 0; i < data.ir.length; i++) ppgChart.push(data.ir[i]);
+        }
+      } else {
+        handleJson(data);
+      }
     } catch (e) { 
       console.error("Erro ao processar JSON:", e); 
     }

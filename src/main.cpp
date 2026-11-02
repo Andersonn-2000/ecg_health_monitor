@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -31,14 +30,27 @@
 
 #define ADS_ENDERECO  0x48
 
-// MAX30102
-#define PPG_PERIODO_MS 10
+// MAX30102 - taxa de amostragem (criterio de Nyquist)
+#define PPG_SAMPLE_RATE_HW 400
+#define PPG_SAMPLE_AVG 4
+#define PPG_FS_HZ (PPG_SAMPLE_RATE_HW / PPG_SAMPLE_AVG)   // 100 Hz
+#define PPG_PERIODO_MS (1000 / PPG_FS_HZ)
+
+#define PPG_ALG_FS_HZ 25
+#define PPG_DECIM (PPG_FS_HZ / PPG_ALG_FS_HZ)
 #define PPG_BUFFER_SIZE 100
 #define PPG_PASSO 25
+#define PPG_DC_ALPHA 0.03f
 #define LIMIAR_DEDO_IR 50000UL
 
 // ADS8232
-#define ECG_PERIODO_MS 4 // periodo de aquisicao do ECG
+// Adotado 250 Hz
+#define ECG_FS_HZ 250
+static_assert(1000 % ECG_FS_HZ == 0, "ECG_FS_HZ deve dividir 1000 (periodo em ms inteiro)");
+#define ECG_PERIODO_MS (1000 / ECG_FS_HZ)           // 4 ms
+// Constantes do detector derivadas de fs 
+#define ECG_BASELINE_ALPHA (2.5f / ECG_FS_HZ)
+#define ECG_ENV_DECAY (1.0f - 1.25f / ECG_FS_HZ)
 #define ECG_LIMIAR_MIN_MV 10.0f
 #define ECG_ENVELOPE_MIN_MV 15.0f
 #define ECG_REFRACTARIO_MS 250
@@ -79,8 +91,8 @@ struct VitalSigns {
 
 const char* hostname = "monitorvital";
 const int port = 80;
-const char* ssid = "TP-LINK_D16A";
-const char* password = "35854180";
+const char* ssid = "MonitorVital-ESP32";
+const char* password = "viuusw24";
 
 // criação do objeto do server e do websocket (url "/wb")
 
@@ -94,6 +106,11 @@ Adafruit_ADS1015 ads;
 MAX30105 sensorPPG;
 
 QueueHandle_t queueECG = nullptr;
+
+#define STREAM_PERIOD_MS 100
+struct PpgWave { int32_t ir; int32_t red; };
+QueueHandle_t queueWaveECG = nullptr; 
+QueueHandle_t queueWavePPG = nullptr;   
 
 SemaphoreHandle_t mutexI2C = nullptr;
 SemaphoreHandle_t mutexVital = nullptr;
@@ -148,6 +165,33 @@ void broadcastVitalSigns(VitalSigns *v) {
              v->tempValid, v->tempC);
 
     ws.textAll(jsonBuffer);
+}
+
+// envia em lote as amostras acumuladas (ECG @250 Hz, PPG @100 Hz)
+void broadcastWaves() {
+    static int16_t ecgA[100];
+    static PpgWave ppgA[50];
+    static char buf[2048];
+    size_t ne = 0, np = 0;
+
+    // sempre esvazia as filas, mesmo sem clientes, para nao enviar dados velhos depois
+    while (ne < 100 && xQueueReceive(queueWaveECG, &ecgA[ne], 0) == pdTRUE) ne++;
+    while (np < 50 && xQueueReceive(queueWavePPG, &ppgA[np], 0) == pdTRUE) np++;
+
+    if (ws.count() == 0 || !ws.availableForWriteAll() || (ne == 0 && np == 0)) return;
+
+    size_t n = snprintf(buf, sizeof(buf), "{\"w\":1,\"ecg\":[");
+    for (size_t i = 0; i < ne && n < sizeof(buf) - 16; i++)
+        n += snprintf(buf + n, sizeof(buf) - n, i ? ",%d" : "%d", ecgA[i]);
+    n += snprintf(buf + n, sizeof(buf) - n, "],\"ir\":[");
+    for (size_t i = 0; i < np && n < sizeof(buf) - 16; i++)
+        n += snprintf(buf + n, sizeof(buf) - n, i ? ",%ld" : "%ld", (long)ppgA[i].ir);
+    n += snprintf(buf + n, sizeof(buf) - n, "],\"red\":[");
+    for (size_t i = 0; i < np && n < sizeof(buf) - 16; i++)
+        n += snprintf(buf + n, sizeof(buf) - n, i ? ",%ld" : "%ld", (long)ppgA[i].red);
+    snprintf(buf + n, sizeof(buf) - n, "]}");
+
+    ws.textAll(buf);
 }
 
 // evento do WebSocket (trata conexões/desconexões)
@@ -271,19 +315,23 @@ void taskProcessECG(void *parametro) {
         }
 
         // remove aproximadamente o nivel DC do sinal.
-        baseline = baseline * 0.99f + sample.mV * 0.01f;
+        if (baseline == 0.0f) baseline = sample.mV;   // evita transiente inicial
+        baseline += ECG_BASELINE_ALPHA * (sample.mV - baseline);
         float sinal = sample.mV - baseline;
 
         if (xSemaphoreTake(mutexVital, pdMS_TO_TICKS(2)) == pdTRUE){
             vital.ecg_mV = sinal;
             xSemaphoreGive(mutexVital);
         }
+        // forma de onda completa (250 Hz) para o grafico
+        int16_t wave = (int16_t)lroundf(fminf(fmaxf(sinal, -32000.0f), 32000.0f));
+        xQueueSend(queueWaveECG, &wave, 0);
         // envelope baseado na magnitude do sinal.
         float magnitude = fabsf(sinal);
         if (magnitude > envelope) {
             envelope = magnitude;
         } else {
-            envelope *= 0.995f;
+            envelope *= ECG_ENV_DECAY;
         }
         float threshold = fmaxf(ECG_LIMIAR_MIN_MV, envelope * 0.55f);
 
@@ -358,6 +406,14 @@ void taskPPG(void *parametro) {
     uint32_t lastIR = 0;
     uint32_t lastSamplesMs = 0;
 
+    // decimacao 4:1 (100 Hz -> 25 Hz) para o algoritmo de SpO2/BPM
+    uint32_t accIR = 0, accRED = 0;
+    uint8_t accN = 0;
+
+    // remocao de DC para o grafico
+    float dcIR = 0.0f, dcRED = 0.0f;
+    bool dcInit = false;
+
     TickType_t previousState = xTaskGetTickCount();
 
     for (;;) {
@@ -376,17 +432,38 @@ void taskPPG(void *parametro) {
                 lastSamplesMs = millis();
                 receivedSamples = true;
 
+                // forma de onda (100 Hz) para o grafico, so com dedo presente
+                if (ir > LIMIAR_DEDO_IR) {
+                    if (!dcInit) { dcIR = ir; dcRED = red; dcInit = true; }
+                    dcIR  += PPG_DC_ALPHA * ((float)ir  - dcIR);
+                    dcRED += PPG_DC_ALPHA * ((float)red - dcRED);
+                    PpgWave w = { (int32_t)lroundf(dcIR - (float)ir), (int32_t)lroundf(dcRED - (float)red) };
+                    xQueueSend(queueWavePPG, &w, 0);
+                } else {
+                    dcInit = false;
+                }
+
+                // decimacao por media (anti-aliasing) -> 25 Hz para o algoritmo
+                accIR += ir;
+                accRED += red;
+                if (++accN < PPG_DECIM) continue;
+
+                uint32_t irD = accIR / accN;
+                uint32_t redD = accRED / accN;
+                accIR = accRED = 0;
+                accN = 0;
+
                 if (full < PPG_BUFFER_SIZE) {
-                    bufferIR[full] = ir;
-                    bufferRED[full] = red;
+                    bufferIR[full] = irD;
+                    bufferRED[full] = redD;
                     full++;
                 } else {
                     // janela deslizante, remove a sample mais antiga
                     memmove(bufferIR, bufferIR + 1, (PPG_BUFFER_SIZE - 1) * sizeof(uint32_t));
                     memmove(bufferRED, bufferRED + 1, (PPG_BUFFER_SIZE - 1) * sizeof(uint32_t));
 
-                    bufferIR[PPG_BUFFER_SIZE - 1] = ir;
-                    bufferRED[PPG_BUFFER_SIZE - 1] = red;
+                    bufferIR[PPG_BUFFER_SIZE - 1] = irD;
+                    bufferRED[PPG_BUFFER_SIZE - 1] = redD;
                 }
 
                 news++;
@@ -407,6 +484,8 @@ void taskPPG(void *parametro) {
         if (!fingerPresent) {
             full = 0;
             news = 0;
+            accIR = accRED = 0;
+            accN = 0;
             bufferAnalised = false;
             invalidatePPG(false);
 
@@ -518,6 +597,15 @@ void taskTemperature(void *pv){
     }
 }
 
+// Task: envio das formas de onda (ECG/PPG) ao navegador
+void taskStream(void *parametro) {
+    TickType_t previousState = xTaskGetTickCount();
+    for (;;) {
+        if (isServerRunning) broadcastWaves();
+        vTaskDelayUntil(&previousState, pdMS_TO_TICKS(STREAM_PERIOD_MS));
+    }
+}
+
 // Task 5: monitor serial
 
 void taskMonitor(void *parametro) {
@@ -594,7 +682,7 @@ void setup() {
     WiFi.softAP(ssid, password);
     delay(100);
     Serial.printf("Rede WiFi \"%s\" criada com sucesso\n", ssid);
-    Serial.printf("Endereço IP do AP: %s\n", WiFi.softAPIP().toString()); // geralmente 192.168.4.1
+    Serial.printf("Endereço IP do AP: %s\n", WiFi.softAPIP().toString().c_str()); // geralmente 192.168.4.1
 
     // inicializa o mDNS
     if(MDNS.begin(hostname)) {
@@ -604,15 +692,30 @@ void setup() {
         Serial.println("Aviso: Erro ao configurar mDNS.");
     }
 
-    // inicializa a memória Flash
-    if (LittleFS.begin(true)) {
-        server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
-    } else {
-        Serial.println("Erro ao montar LittleFS");
-    }
-
+    // WebSocket primeiro, depois os arquivos estaticos
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
+
+    // inicializa a memória Flash e confere se o index.html foi gravado (uploadfs)
+    bool fsOk = LittleFS.begin(true);
+    bool hasIndex = fsOk && LittleFS.exists("/index.html");
+    Serial.printf("LittleFS: %s | /index.html: %s\n", fsOk ? "montado" : "FALHOU", hasIndex ? "encontrado" : "NAO ENCONTRADO");
+
+    if (hasIndex) {
+        server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+    } else {
+        Serial.println(">> Grave o sistema de arquivos: coloque index.html em data/ e rode 'Upload Filesystem Image'.");
+        server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+            request->send(200, "text/html; charset=utf-8",
+                "<h2>ESP32 online, mas o index.html n&atilde;o est&aacute; no LittleFS.</h2>"
+                "<p>Coloque o arquivo em <code>data/index.html</code> e execute "
+                "<b>Upload Filesystem Image</b> (PlatformIO: <code>pio run -t uploadfs</code>).</p>");
+        });
+    }
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        request->send(404, "text/plain", "Nao encontrado");
+    });
+
     server.begin();
     isServerRunning = true;
 
@@ -621,8 +724,11 @@ void setup() {
     mutexVital = xSemaphoreCreateMutex();
 
     queueECG = xQueueCreate(256, sizeof(SampleECG));
+    queueWaveECG = xQueueCreate(512, sizeof(int16_t));
+    queueWavePPG = xQueueCreate(256, sizeof(PpgWave));
 
-    if (mutexI2C == nullptr || mutexVital == nullptr || queueECG == nullptr) {
+    if (mutexI2C == nullptr || mutexVital == nullptr || queueECG == nullptr ||
+        queueWaveECG == nullptr || queueWavePPG == nullptr) {
 
         Serial.println("Falha ao criar recursos FreeRTOS");
         while (true) {
@@ -651,7 +757,7 @@ void setup() {
 
     // LED, media, modo LED, taxa de amostragem,
     // largura do pulso e faixa do ADC
-    sensorPPG.setup(60, 4, 2, 100, 411, 4096);
+    sensorPPG.setup(60, PPG_SAMPLE_AVG, 2, PPG_SAMPLE_RATE_HW, 411, 4096);   // saida = 400/4 = 100 SPS
 
     Serial.println("Sensores inicializados.");
 
@@ -693,6 +799,13 @@ void setup() {
     result = xTaskCreatePinnedToCore(taskTemperature, "Temperature", 4096, nullptr, 1, nullptr, 0);
     if (result != pdPASS){
         Serial.printf("Não foi possivel criar taskTemperature!");
+        while (true) {
+            delay(1000);
+        }
+    }
+    result = xTaskCreatePinnedToCore(taskStream, "Stream", 4096, nullptr, 1, nullptr, 0);
+    if (result != pdPASS) {
+        Serial.println("Nao foi possivel criar taskStream!");
         while (true) {
             delay(1000);
         }
