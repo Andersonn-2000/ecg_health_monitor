@@ -5,7 +5,9 @@ export interface DataRaw {
   bpmPPGValid: number,
   bpmPPG: number,
   spo2Valid: number,
-  spo2: number
+  spo2: number,
+  tempValid: number,
+  tempC: number
 }
 
 export interface Data {
@@ -15,5 +17,7 @@ export interface Data {
   bpmPPGValid: boolean,
   bpmPPG: number,
   spo2Valid: boolean,
-  spo2: number
+  spo2: number,
+  tempValid: boolean,
+  tempC: number
 }

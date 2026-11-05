@@ -1,6 +1,6 @@
 import path from "path"
 import tailwindcss from "@tailwindcss/vite"
-import viteCompression from "vite-plugin-compression"
+//import viteCompression from "vite-plugin-compression"
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
@@ -10,6 +10,7 @@ export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    /*
     // @ts-ignore
     viteCompression({
       algorithm: 'gzip',
@@ -17,6 +18,7 @@ export default defineConfig({
       threshold: 0, // Força a compactação de TODOS os arquivos
       deleteOriginFile: true
     })
+    */
   ],
   resolve: {
     alias: {
